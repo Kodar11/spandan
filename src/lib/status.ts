@@ -132,9 +132,13 @@ export function getWhitelistedNonMusicTabs(
 export async function getComputedStatus(
   settings: ExtensionSettings,
   state: ExtensionState,
+  /** Optional adjustment of the audible-tab list (used by the worker). */
+  filterAudibleTabs?: (tabs: chrome.tabs.Tab[]) => Promise<chrome.tabs.Tab[]>,
 ): Promise<StatusPayload> {
   const [audibleTabs, videoStatus] = await Promise.all([
-    queryAudibleTabs(),
+    filterAudibleTabs
+      ? queryAudibleTabs().then(filterAudibleTabs)
+      : queryAudibleTabs(),
     state.musicTab?.tabId ? queryVideoStatus(state.musicTab.tabId) : null,
   ])
   return computeStatus(settings, state, audibleTabs, videoStatus ?? undefined)

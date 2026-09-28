@@ -220,7 +220,11 @@ async function handleMessage(
 
 async function handleGetStatus(): Promise<ExtensionResponse> {
   const [settings, state] = await Promise.all([getSettings(), getState()])
-  const status = await getComputedStatus(settings, state)
+  const status = await getComputedStatus(
+    settings,
+    state,
+    excludeRetiredMusicTab,
+  )
   return { ok: true, payload: status }
 }
 
@@ -232,6 +236,32 @@ async function handleSetMusicTab(
       ok: false,
       payload: 'Only YouTube tabs can be set as the music tab.',
     }
+  }
+
+  // Runs in the evaluation queue so no in-flight evaluation can act on the
+  // old/new tab halfway through the switch.
+  await runExclusive(() => replaceMusicTab(musicTab))
+
+  return { ok: true, payload: musicTab }
+}
+
+async function replaceMusicTab(musicTab: MusicTab): Promise<void> {
+  const [settings, previous] = await Promise.all([getSettings(), getState()])
+  const previousTab = previous.musicTab
+
+  if (previousTab?.tabId === musicTab.tabId) {
+    // Same tab selected again: refresh its details but keep its playback and
+    // manual-pause state, so nothing pauses or restarts.
+    await setState({ musicTab })
+    await evaluatePlaybackNow()
+    return
+  }
+
+  // The pending resume belonged to the old tab.
+  cancelResumeTimer()
+
+  if (previousTab && settings.enabled) {
+    await retirePreviousMusicTab(previousTab, settings)
   }
 
   // Query the actual video state so we don't trigger an unwanted fade-in
@@ -247,9 +277,35 @@ async function handleSetMusicTab(
       : false,
     waitingToResumeUntil: null,
   })
-  await evaluatePlayback()
+  await evaluatePlaybackNow()
+}
 
-  return { ok: true, payload: musicTab }
+/**
+ * Pause the outgoing music tab so it doesn't keep playing as competing audio.
+ * This is an extension action (the content script's extensionPaused flag
+ * suppresses USER_STATE_CHANGED), so it never counts as a manual pause.
+ */
+async function retirePreviousMusicTab(
+  previousTab: MusicTab,
+  settings: ExtensionSettings,
+): Promise<void> {
+  // Null when the tab was closed or can't be read; nothing to pause then.
+  const status = await queryVideoStatus(previousTab.tabId)
+  if (!status?.isPlaying) return
+
+  retiredMusicTab = {
+    tabId: previousTab.tabId,
+    expiresAt: Date.now() + RETIRED_TAB_GRACE_MS,
+  }
+
+  const ok = await sendCommand(previousTab.tabId, 'FADE_OUT_PAUSE', {
+    durationMs: settings.fadeDurationMs,
+  })
+  if (!ok) {
+    // Still playing, so it is genuine competing audio; the new tab follows
+    // the normal rules. excludeRetiredMusicTab won't hide a playing video.
+    console.warn(`[spandan] could not pause previous music tab ${previousTab.tabId}`)
+  }
 }
 
 async function handleUserStateChanged(
@@ -258,7 +314,13 @@ async function handleUserStateChanged(
 ): Promise<void> {
   if (!tabId) return
   const state = await getState()
-  if (!isMusicTab(tabId, state.musicTab)) return
+  if (!isMusicTab(tabId, state.musicTab)) {
+    // The user playing the previous music tab again within its grace window
+    // fires no audible event (the flag never dropped), so re-evaluate here or
+    // it wouldn't count as competing audio until the backup alarm.
+    if (retiredMusicTab?.tabId === tabId) await evaluatePlayback()
+    return
+  }
 
   // The content script only sends this for media events it did not cause
   // itself (extensionPaused / extensionPlayed / extensionFading), so this
@@ -376,24 +438,66 @@ async function ensureBackupAlarm(): Promise<void> {
 // Play/pause orchestration
 // ---------------------------------------------------------------------------
 
-// Evaluations are serialized so two triggers (e.g. an audible event and the
-// resume timer) can never send overlapping fades to the same video. Requests
-// that arrive while one is queued share that queued run.
-let evaluationChain: Promise<void> = Promise.resolve()
+// Evaluations (and music-tab replacement) are serialized so two triggers
+// (e.g. an audible event and the resume timer) can never send overlapping
+// fades to the same video. Evaluation requests that arrive while one is
+// queued share that queued run.
+let exclusiveChain: Promise<void> = Promise.resolve()
 let queuedEvaluation: Promise<void> | null = null
+
+// Must never await evaluatePlayback() or runExclusive() inside a task, or the
+// queue deadlocks; call evaluatePlaybackNow() directly instead.
+function runExclusive(task: () => Promise<void>): Promise<void> {
+  const run = exclusiveChain.then(task)
+  exclusiveChain = run.catch((error: unknown) => {
+    console.warn('[spandan] playback task failed', error)
+  })
+  return run
+}
 
 function evaluatePlayback(): Promise<void> {
   if (queuedEvaluation) return queuedEvaluation
 
-  const run = evaluationChain.then(() => {
+  const run = runExclusive(() => {
     queuedEvaluation = null
     return evaluatePlaybackNow()
   })
   queuedEvaluation = run
-  evaluationChain = run.catch((error: unknown) => {
-    console.warn('[spandan] evaluatePlayback failed', error)
-  })
   return run
+}
+
+// The music tab we just replaced and paused. Chrome keeps reporting a tab as
+// audible for a couple of seconds after it goes quiet, which would make the
+// old tab look like competing audio and pause the new music tab. In memory is
+// enough: the window is seconds long and the worker is busy throughout.
+let retiredMusicTab: { tabId: number; expiresAt: number } | null = null
+const RETIRED_TAB_GRACE_MS = 10_000
+
+/**
+ * Drop the previous music tab from the audible list while it is only
+ * "audible" because of Chrome's lag, i.e. its video is verifiably paused.
+ * If it is actually playing (pause failed, or the user played it again), it
+ * counts as normal competing audio.
+ */
+async function excludeRetiredMusicTab(
+  audibleTabs: chrome.tabs.Tab[],
+): Promise<chrome.tabs.Tab[]> {
+  const retired = retiredMusicTab
+  if (!retired) return audibleTabs
+
+  const stillAudible = audibleTabs.some((tab) => tab.id === retired.tabId)
+  if (!stillAudible || Date.now() > retired.expiresAt) {
+    retiredMusicTab = null
+    return audibleTabs
+  }
+
+  const status = await queryVideoStatus(retired.tabId)
+  if (status && !status.isPlaying) {
+    return audibleTabs.filter((tab) => tab.id !== retired.tabId)
+  }
+
+  if (status?.isPlaying) retiredMusicTab = null
+  return audibleTabs
 }
 
 // Must never call evaluatePlayback() and await it, or the queue deadlocks.
@@ -416,7 +520,7 @@ async function evaluatePlaybackNow(): Promise<void> {
   if (!(await verifyMusicTab(state.musicTab))) return
 
   const [audibleTabs, videoStatus] = await Promise.all([
-    queryAudibleTabs(),
+    queryAudibleTabs().then(excludeRetiredMusicTab),
     queryVideoStatus(state.musicTab.tabId),
   ])
 
