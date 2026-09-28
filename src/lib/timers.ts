@@ -1,9 +1,11 @@
 /**
  * Resume-delay timer manager.
  *
- * The service worker can be terminated by the browser at any time, so timers
- * are kept in-memory only. If the worker is killed, the next audible event or
- * poll will re-trigger evaluation and restart the timer if needed.
+ * The service worker can be terminated by the browser at any time, so this
+ * in-memory timer is only the fast path. The authoritative deadline is the
+ * persisted `waitingToResumeUntil` timestamp: every evaluation re-arms this
+ * timer for the remaining time if it was lost, and resumes immediately if the
+ * deadline already passed (e.g. when the backup alarm wakes a fresh worker).
  */
 
 export type TimerCallback = () => void

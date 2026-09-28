@@ -5,6 +5,7 @@
   "description": "Automatically pause and resume background music tabs while you browse.",
   "permissions": [
     "storage",
+    "alarms",
     "tabs",
     "activeTab",
     "scripting"

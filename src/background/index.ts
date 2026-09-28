@@ -7,11 +7,13 @@ import {
 } from '@/lib/storage'
 import {
   cancelResumeTimer,
+  hasResumeTimer,
   scheduleResumeTimer,
 } from '@/lib/timers'
 import { getComputedStatus, getWhitelistedNonMusicTabs } from '@/lib/status'
 import {
   findTabByUrl,
+  getUrlKey,
   isMusicTab,
   isYouTubeUrl,
   queryAudibleTabs,
@@ -21,6 +23,7 @@ import type {
   ExtensionMessage,
   ExtensionResponse,
   ExtensionSettings,
+  ExtensionState,
   MusicTab,
   VideoStatus,
 } from '@/types'
@@ -35,23 +38,55 @@ import type {
  * - Apply resume delays and fade durations from settings.
  * - Enforce the website whitelist.
  * - Report rich status to the popup.
+ *
+ * MV3 service workers are ephemeral, so nothing here relies on in-memory
+ * timers for correctness. Tab events (audible/url/removed) drive evaluation;
+ * a chrome.alarms backup re-evaluates periodically in case an event is missed;
+ * the resume deadline is persisted so a fresh worker can honour it.
  */
+
+const BACKUP_ALARM_NAME = 'spandan-backup-evaluation'
+// Chrome's minimum alarm period (30s). Events provide fast response; this is
+// only a liveness/reconciliation fallback.
+const BACKUP_ALARM_PERIOD_MINUTES = 0.5
+
+// chrome.storage.session is cleared on browser restart and extension reload,
+// both of which can invalidate the saved tab ID.
+const SESSION_STARTED_KEY = 'sessionStarted'
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 chrome.runtime.onInstalled.addListener(async () => {
-  console.log('[spandan] extension installed')
-
   const existing = await getSettings()
   await setSettings({ ...DEFAULT_SETTINGS, ...existing })
 })
 
-chrome.runtime.onStartup.addListener(async () => {
-  console.log('[spandan] browser started')
-  await restoreMusicTab()
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === BACKUP_ALARM_NAME) {
+    evaluatePlayback().catch(() => {})
+  }
 })
+
+// Runs every time the service worker starts (browser start, extension reload,
+// or waking from idle). Covers what chrome.runtime.onStartup used to do.
+initializeWorker().catch((error: unknown) => {
+  console.warn('[spandan] worker initialization failed', error)
+})
+
+async function initializeWorker(): Promise<void> {
+  const session = await chrome.storage.session.get(SESSION_STARTED_KEY)
+
+  if (!session[SESSION_STARTED_KEY]) {
+    await chrome.storage.session.set({ [SESSION_STARTED_KEY]: true })
+    await restoreMusicTab()
+  } else {
+    // Worker woke from idle: tab IDs are still valid. Re-arm the backup alarm
+    // and any pending resume timer lost with the previous worker.
+    await evaluatePlayback()
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Tab event listeners
@@ -62,7 +97,6 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
   if (isMusicTab(tabId, state.musicTab)) {
     if (tab.url && !isYouTubeUrl(tab.url)) {
-      console.log('[spandan] music tab left YouTube, clearing')
       await clearMusicTab()
       return
     }
@@ -78,10 +112,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
   }
 
-  // Polling is the primary mechanism for detecting audible changes.
-  // We still trigger an evaluation on navigation so SPA route changes are
-  // handled promptly.
-  if (changeInfo.url) {
+  // Audible changes are the primary trigger for pause/resume. Navigation also
+  // triggers an evaluation so SPA route changes are handled promptly.
+  if (changeInfo.audible !== undefined || changeInfo.url) {
     await evaluatePlayback()
   }
 })
@@ -90,7 +123,6 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   const state = await getState()
 
   if (isMusicTab(tabId, state.musicTab)) {
-    console.log('[spandan] music tab closed, clearing')
     await clearMusicTab()
   } else {
     await evaluatePlayback()
@@ -105,6 +137,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
   if (!newSettings.enabled) {
     stopAllAutomation()
+    // The resume timer was cancelled, so don't leave a stale deadline behind.
+    setState({ waitingToResumeUntil: null }).catch(() => {})
     return
   }
 
@@ -161,7 +195,6 @@ async function handleMessage(
     case 'CONTENT_READY': {
       const state = await getState()
       if (sender.tab?.id && isMusicTab(sender.tab.id, state.musicTab)) {
-        console.log('[spandan] music tab content script ready')
         await evaluatePlayback()
       }
       return { ok: true }
@@ -194,8 +227,6 @@ async function handleGetStatus(): Promise<ExtensionResponse> {
 async function handleSetMusicTab(
   musicTab: MusicTab,
 ): Promise<ExtensionResponse> {
-  console.log('[spandan] set music tab request', musicTab)
-
   if (!isYouTubeUrl(musicTab.url)) {
     return {
       ok: false,
@@ -204,14 +235,16 @@ async function handleSetMusicTab(
   }
 
   // Query the actual video state so we don't trigger an unwanted fade-in
-  // when the user selects a tab that is already playing.
+  // when the user selects a tab that is already playing. A paused video is
+  // not a manual pause; only a paused *and* muted one signals that intent.
   const videoStatus = await queryVideoStatus(musicTab.tabId)
-  console.log('[spandan] initial video status for music tab', videoStatus)
 
   await setState({
     musicTab,
-    isPlaying: videoStatus.isPlaying,
-    manuallyPaused: !videoStatus.isPlaying && videoStatus.isMuted,
+    isPlaying: videoStatus?.isPlaying ?? false,
+    manuallyPaused: videoStatus
+      ? !videoStatus.isPlaying && videoStatus.isMuted
+      : false,
     waitingToResumeUntil: null,
   })
   await evaluatePlayback()
@@ -227,29 +260,22 @@ async function handleUserStateChanged(
   const state = await getState()
   if (!isMusicTab(tabId, state.musicTab)) return
 
-  console.log('[spandan] USER_STATE_CHANGED received', status, {
-    previousManuallyPaused: state.manuallyPaused,
-  })
-
+  // The content script only sends this for media events it did not cause
+  // itself (extensionPaused / extensionPlayed / extensionFading), so this
+  // reflects a user action.
   const userIsActivelyListening = status.isPlaying && !status.isMuted
 
   if (userIsActivelyListening) {
-    if (state.manuallyPaused) {
-      console.log('[spandan] user resumed music, clearing manual pause')
-    }
     // User resumed the music (play or unmute). Re-enable auto-management and
     // let evaluatePlayback decide whether to fade out again immediately.
     await setState({ manuallyPaused: false, isPlaying: true })
     await evaluatePlayback()
   } else {
-    if (!state.manuallyPaused) {
-      console.log('[spandan] user paused/muted music, suspending auto-management')
-    }
     // User paused or muted the music. Suspend auto-management until they
     // explicitly resume.
     cancelResumeTimer()
     await setState({
-      isPlaying: false,
+      isPlaying: status.isPlaying,
       manuallyPaused: true,
       waitingToResumeUntil: null,
     })
@@ -270,11 +296,18 @@ async function clearMusicTab(): Promise<void> {
   })
 }
 
+/**
+ * Re-attach to the saved music tab after the tab ID may have become invalid
+ * (browser restart resets IDs; extension reload keeps them).
+ */
 async function restoreMusicTab(): Promise<void> {
   const state = await getState()
   if (!state.musicTab) return
 
-  const tab = await findTabByUrl(state.musicTab.url)
+  const tab =
+    (await getTabIfSameUrl(state.musicTab)) ??
+    (await findTabByUrl(state.musicTab.url))
+
   if (tab?.id) {
     await setState({
       musicTab: {
@@ -285,28 +318,88 @@ async function restoreMusicTab(): Promise<void> {
     })
     await evaluatePlayback()
   } else {
-    console.log('[spandan] saved music tab not found on startup, clearing')
     await clearMusicTab()
   }
 }
 
-function stopAllAutomation(): void {
-  cancelResumeTimer()
-  stopPolling()
+async function getTabIfSameUrl(
+  musicTab: MusicTab,
+): Promise<chrome.tabs.Tab | undefined> {
+  try {
+    const tab = await chrome.tabs.get(musicTab.tabId)
+    if (tab.url && getUrlKey(tab.url) === getUrlKey(musicTab.url)) {
+      return tab
+    }
+  } catch {
+    // Tab ID no longer exists.
+  }
+  return undefined
 }
 
-// ---------------------------------------------------------------------------
-// Status computation
-// ---------------------------------------------------------------------------
+/**
+ * Confirm the saved tab ID still refers to a YouTube tab. Clears the music tab
+ * otherwise, so a stale ID can't make every command fail indefinitely.
+ */
+async function verifyMusicTab(musicTab: MusicTab): Promise<boolean> {
+  try {
+    const tab = await chrome.tabs.get(musicTab.tabId)
+    if (!tab.url || isYouTubeUrl(tab.url)) return true
+  } catch {
+    // Tab was closed while we missed the onRemoved event.
+  }
+  await clearMusicTab()
+  return false
+}
+
+function stopAllAutomation(): void {
+  cancelResumeTimer()
+  chrome.alarms.clear(BACKUP_ALARM_NAME).catch(() => {})
+}
+
+/**
+ * Make sure the periodic backup alarm exists. Alarms persist across worker
+ * restarts, so only create it when missing; recreating would keep pushing the
+ * next firing back.
+ */
+async function ensureBackupAlarm(): Promise<void> {
+  const existing = await chrome.alarms.get(BACKUP_ALARM_NAME)
+  if (existing?.periodInMinutes === BACKUP_ALARM_PERIOD_MINUTES) return
+
+  // Same name replaces any existing alarm, so this never creates duplicates.
+  await chrome.alarms.create(BACKUP_ALARM_NAME, {
+    delayInMinutes: BACKUP_ALARM_PERIOD_MINUTES,
+    periodInMinutes: BACKUP_ALARM_PERIOD_MINUTES,
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Play/pause orchestration
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL_MS = 1000
-let pollTimer: ReturnType<typeof setInterval> | null = null
+// Evaluations are serialized so two triggers (e.g. an audible event and the
+// resume timer) can never send overlapping fades to the same video. Requests
+// that arrive while one is queued share that queued run.
+let evaluationChain: Promise<void> = Promise.resolve()
+let queuedEvaluation: Promise<void> | null = null
 
-async function evaluatePlayback(): Promise<void> {
-  const [settings, state] = await Promise.all([getSettings(), getState()])
+function evaluatePlayback(): Promise<void> {
+  if (queuedEvaluation) return queuedEvaluation
+
+  const run = evaluationChain.then(() => {
+    queuedEvaluation = null
+    return evaluatePlaybackNow()
+  })
+  queuedEvaluation = run
+  evaluationChain = run.catch((error: unknown) => {
+    console.warn('[spandan] evaluatePlayback failed', error)
+  })
+  return run
+}
+
+// Must never call evaluatePlayback() and await it, or the queue deadlocks.
+async function evaluatePlaybackNow(): Promise<void> {
+  const [settings, storedState] = await Promise.all([getSettings(), getState()])
+  let state = storedState
 
   if (!settings.enabled) {
     stopAllAutomation()
@@ -318,10 +411,20 @@ async function evaluatePlayback(): Promise<void> {
     return
   }
 
+  await ensureBackupAlarm()
+
+  if (!(await verifyMusicTab(state.musicTab))) return
+
   const [audibleTabs, videoStatus] = await Promise.all([
     queryAudibleTabs(),
     queryVideoStatus(state.musicTab.tabId),
   ])
+
+  // Reconcile the cached flag with the real video whenever it is readable.
+  if (videoStatus && videoStatus.isPlaying !== state.isPlaying) {
+    await setState({ isPlaying: videoStatus.isPlaying })
+    state = { ...state, isPlaying: videoStatus.isPlaying }
+  }
 
   const nonMusicAudibleTabs = getWhitelistedNonMusicTabs(
     audibleTabs,
@@ -329,27 +432,17 @@ async function evaluatePlayback(): Promise<void> {
     settings.whitelist,
   )
 
-  console.log('[spandan] evaluatePlayback', {
-    nonMusic: nonMusicAudibleTabs.map((t) => ({ id: t.id, title: t.title })),
-    videoStatus,
-    cachedIsPlaying: state.isPlaying,
-    manuallyPaused: state.manuallyPaused,
-    waitingUntil: state.waitingToResumeUntil,
-  })
-
   if (nonMusicAudibleTabs.length > 0) {
     await handleNonMusicPlaying(settings, state, videoStatus)
   } else {
     await handleSilence(settings, state, videoStatus)
   }
-
-  updatePolling(settings.enabled, state.musicTab)
 }
 
 async function handleNonMusicPlaying(
   settings: ExtensionSettings,
-  state: Awaited<ReturnType<typeof getState>>,
-  videoStatus: VideoStatus,
+  state: ExtensionState,
+  videoStatus: VideoStatus | null,
 ): Promise<void> {
   if (!state.musicTab?.tabId) return
 
@@ -364,21 +457,24 @@ async function handleNonMusicPlaying(
     return
   }
 
-  // Always trust the actual video element over the cached state.
-  if (videoStatus.isPlaying) {
-    const ok = await sendCommand(state.musicTab.tabId, 'FADE_OUT_PAUSE', {
-      durationMs: settings.fadeDurationMs,
-    })
-    if (ok) {
-      await setState({ isPlaying: false })
-    }
+  // Trust the actual video element; fall back to the cached flag only when
+  // the video can't be read.
+  const mayBePlaying = videoStatus ? videoStatus.isPlaying : state.isPlaying
+  if (!mayBePlaying) return
+
+  const ok = await sendCommand(state.musicTab.tabId, 'FADE_OUT_PAUSE', {
+    durationMs: settings.fadeDurationMs,
+  })
+  // On failure isPlaying stays true; the next event or backup alarm retries.
+  if (ok) {
+    await setState({ isPlaying: false })
   }
 }
 
 async function handleSilence(
   settings: ExtensionSettings,
-  state: Awaited<ReturnType<typeof getState>>,
-  videoStatus: VideoStatus,
+  state: ExtensionState,
+  videoStatus: VideoStatus | null,
 ): Promise<void> {
   if (!state.musicTab?.tabId) return
 
@@ -386,22 +482,33 @@ async function handleSilence(
     return
   }
 
-  // If the video is already playing, nothing to do.
-  if (videoStatus.isPlaying) {
-    if (!state.isPlaying) {
-      await setState({ isPlaying: true })
+  // Already playing (e.g. the user pressed play during the wait): nothing to
+  // resume, and any pending wait is obsolete.
+  if (videoStatus?.isPlaying) {
+    cancelResumeTimer()
+    if (state.waitingToResumeUntil) {
+      await setState({ waitingToResumeUntil: null })
     }
     return
   }
 
-  // If we were waiting and the timer should have fired while the worker was
-  // away, resume immediately rather than starting a new delay.
   if (state.waitingToResumeUntil) {
-    if (state.waitingToResumeUntil > Date.now()) {
+    const remainingMs = state.waitingToResumeUntil - Date.now()
+    if (remainingMs > 0) {
+      // Re-arm the in-memory timer if a previous worker instance owned it.
+      if (!hasResumeTimer()) {
+        scheduleResumeTimer(() => {
+          evaluatePlayback().catch(() => {})
+        }, remainingMs)
+      }
       return
     }
 
-    console.log('[spandan] resume timer expired while worker was inactive')
+    // Deadline passed (timer fired, or it expired while the worker was
+    // inactive): resume now. Clearing the deadline first means a failed
+    // resume starts a fresh delay on the next event/alarm rather than
+    // retrying in a tight loop.
+    cancelResumeTimer()
     await setState({ waitingToResumeUntil: null })
     const ok = await sendCommand(state.musicTab.tabId, 'FADE_IN_PLAY', {
       durationMs: settings.fadeDurationMs,
@@ -412,62 +519,14 @@ async function handleSilence(
     return
   }
 
-  // Start the resume delay timer.
+  // Start the resume delay. The persisted deadline is authoritative; the
+  // in-memory timer just makes the resume happen on time.
   const resumeAt = Date.now() + settings.resumeDelayMs
   await setState({ waitingToResumeUntil: resumeAt })
 
-  scheduleResumeTimer(async () => {
-    await setState({ waitingToResumeUntil: null })
-
-    const currentSettings = await getSettings()
-    const currentState = await getState()
-
-    if (
-      !currentSettings.enabled ||
-      !currentState.musicTab?.tabId ||
-      currentState.manuallyPaused
-    ) {
-      return
-    }
-
-    const currentVideoStatus = await queryVideoStatus(currentState.musicTab.tabId)
-    if (!currentVideoStatus.isPlaying) {
-      const ok = await sendCommand(
-        currentState.musicTab.tabId,
-        'FADE_IN_PLAY',
-        {
-          durationMs: currentSettings.fadeDurationMs,
-        },
-      )
-      if (ok) {
-        await setState({ isPlaying: true })
-      }
-    }
-
-    await evaluatePlayback()
-  }, settings.resumeDelayMs)
-}
-
-function updatePolling(enabled: boolean, musicTab: MusicTab | null): void {
-  if (enabled && musicTab?.tabId) {
-    startPolling()
-  } else {
-    stopPolling()
-  }
-}
-
-function startPolling(): void {
-  if (pollTimer) return
-  pollTimer = setInterval(() => {
+  scheduleResumeTimer(() => {
     evaluatePlayback().catch(() => {})
-  }, POLL_INTERVAL_MS)
-}
-
-function stopPolling(): void {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  }, settings.resumeDelayMs)
 }
 
 // ---------------------------------------------------------------------------
@@ -483,31 +542,30 @@ async function sendCommand(
     ? { type: command }
     : { type: command, payload }
 
-  console.log(`[spandan] sendCommand START ${command} -> tab ${tabId}`, payload)
-
   try {
     const response = (await chrome.tabs.sendMessage(tabId, message)) as ExtensionResponse
-    console.log(`[spandan] sendCommand RESPONSE ${command} -> tab ${tabId}:`, response)
 
     if (response?.ok) {
-      console.log(`[spandan] ${command} succeeded on tab ${tabId}`)
       return true
     }
 
     console.warn(`[spandan] ${command} rejected on tab ${tabId}:`, response?.payload)
   } catch (error) {
     console.warn(`[spandan] sendCommand ERROR ${command} -> tab ${tabId}:`, error)
+
+    // After an extension reload, the tab's old content script is orphaned and
+    // nothing is listening. Re-inject so the retry below can succeed.
+    if (isMissingReceiverError(error)) {
+      await injectContentScript(tabId)
+    }
   }
 
-  console.log(`[spandan] sendCommand RETRY ${command} -> tab ${tabId} in 500ms`)
   await delay(500)
 
   try {
     const retryResponse = (await chrome.tabs.sendMessage(tabId, message)) as ExtensionResponse
-    console.log(`[spandan] sendCommand RETRY RESPONSE ${command} -> tab ${tabId}:`, retryResponse)
 
     if (retryResponse?.ok) {
-      console.log(`[spandan] ${command} retry succeeded on tab ${tabId}`)
       return true
     }
 
@@ -516,8 +574,27 @@ async function sendCommand(
     console.warn(`[spandan] ${command} retry failed on tab ${tabId}`, retryError)
   }
 
-  console.log(`[spandan] sendCommand FAILED ${command} -> tab ${tabId}`)
   return false
+}
+
+function isMissingReceiverError(error: unknown): boolean {
+  return String(error).includes('Receiving end does not exist')
+}
+
+async function injectContentScript(tabId: number): Promise<void> {
+  const file = chrome.runtime.getManifest().content_scripts?.[0]?.js?.[0]
+  if (!file) return
+
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    // A loading tab will get the manifest content script on its own;
+    // injecting now could run it twice.
+    if (tab.status !== 'complete' || !isYouTubeUrl(tab.url)) return
+
+    await chrome.scripting.executeScript({ target: { tabId }, files: [file] })
+  } catch (error) {
+    console.warn(`[spandan] content script injection failed on tab ${tabId}`, error)
+  }
 }
 
 function delay(ms: number): Promise<void> {

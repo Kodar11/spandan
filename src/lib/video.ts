@@ -6,24 +6,32 @@ import type { ExtensionResponse, VideoStatus } from '@/types'
  * Uses chrome.scripting.executeScript as the primary mechanism because it works
  * even when the content script has not finished injecting yet. Falls back to
  * the content script message channel if executeScript is unavailable.
+ *
+ * Returns null when the state cannot be read (tab gone, page still loading, no
+ * video element yet). Callers must treat that as "unknown" rather than paused.
  */
-export async function queryVideoStatus(tabId: number): Promise<VideoStatus> {
+export async function queryVideoStatus(
+  tabId: number,
+): Promise<VideoStatus | null> {
   try {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId },
+      // Must be self-contained; mirrors getVideoStatus in src/content/index.ts.
       func: () => {
         const videos = Array.from(document.querySelectorAll('video'))
-        const isPlaying = videos.some((video) => !video.paused)
-        const isMuted = videos.every(
-          (video) => video.muted || video.volume === 0 || video.paused,
+        if (videos.length === 0) return null
+        const playing = videos.filter((video) => !video.paused)
+        const isPlaying = playing.length > 0
+        const relevant = isPlaying ? playing : videos
+        const isMuted = relevant.every(
+          (video) => video.muted || video.volume === 0,
         )
         return { isPlaying, isMuted }
       },
     })
 
-    const status = result?.result as VideoStatus | undefined
+    const status = result?.result as VideoStatus | null | undefined
     if (status) {
-      console.log('[spandan] queryVideoStatus via executeScript', status)
       return status
     }
   } catch (error) {
@@ -42,14 +50,11 @@ export async function queryVideoStatus(tabId: number): Promise<VideoStatus> {
       ? (response.payload as VideoStatus | undefined)
       : undefined
     if (status) {
-      console.log('[spandan] queryVideoStatus via message', status)
       return status
     }
   } catch (error) {
     console.warn('[spandan] message query failed', error)
   }
 
-  // Final fallback: assume paused but not manually paused.
-  console.log('[spandan] queryVideoStatus fallback: paused')
-  return { isPlaying: false, isMuted: false }
+  return null
 }

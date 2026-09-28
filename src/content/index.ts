@@ -31,11 +31,16 @@ function getVideoElements(): HTMLVideoElement[] {
   return Array.from(document.querySelectorAll('video'))
 }
 
+// Keep in sync with the injected copy in src/lib/video.ts.
 function getVideoStatus(videos: HTMLVideoElement[]): VideoStatus {
-  const isPlaying = videos.some((video) => !video.paused)
-  const isMuted = videos.every(
-    (video) => video.muted || video.volume === 0 || video.paused,
-  )
+  const playing = videos.filter((video) => !video.paused)
+  const isPlaying = playing.length > 0
+  // Muted means silenced by mute or zero volume, never merely paused. Judge the
+  // playing video(s) when there are any, otherwise every video on the page.
+  const relevant = isPlaying ? playing : videos
+  const isMuted =
+    relevant.length > 0 &&
+    relevant.every((video) => video.muted || video.volume === 0)
   return { isPlaying, isMuted }
 }
 
@@ -50,6 +55,10 @@ const originalVolumes = new Map<HTMLVideoElement, number>()
 
 let userStateDebounceTimer: ReturnType<typeof setTimeout> | null = null
 const USER_STATE_DEBOUNCE_MS = 100
+
+// Tracked per script instance rather than on the DOM, so a copy re-injected
+// after an extension reload still attaches its own listeners.
+const videosWithListeners = new WeakSet<HTMLVideoElement>()
 
 function notifyBackground(message: ExtensionMessage): void {
   chrome.runtime.sendMessage(message).catch(() => {
@@ -68,13 +77,11 @@ function debouncedNotifyUserState(): void {
     // If an extension action started while we were debouncing, skip the
     // notification so we don't report extension-initiated state as user state.
     if (isExtensionInitiated()) {
-      console.log('[spandan] skipping user state notification: extension active')
       return
     }
 
     const videos = getVideoElements()
     const status = getVideoStatus(videos)
-    console.log('[spandan] debounced user state', status)
     notifyBackground({ type: 'USER_STATE_CHANGED', payload: status })
   }, USER_STATE_DEBOUNCE_MS)
 }
@@ -84,8 +91,8 @@ function isExtensionInitiated(): boolean {
 }
 
 function attachMediaListeners(video: HTMLVideoElement): void {
-  if (video.dataset.spandanListenersAttached === 'true') return
-  video.dataset.spandanListenersAttached = 'true'
+  if (videosWithListeners.has(video)) return
+  videosWithListeners.add(video)
 
   const handleUserMediaEvent = (): void => {
     if (isExtensionInitiated()) return
@@ -105,7 +112,6 @@ function observeNewVideos(): void {
 }
 
 if (isYouTubePage()) {
-  console.log('[spandan] content script active on YouTube', window.location.href)
 
   getVideoElements().forEach(attachMediaListeners)
   observeNewVideos()
@@ -155,7 +161,6 @@ async function fadeOutAndPause(
 ): Promise<void> {
   extensionFading = true
   extensionPaused = true
-  console.log('[spandan] fadeOutAndPause start', videos.length, 'video(s)')
 
   try {
     videos.forEach((video) => {
@@ -167,7 +172,6 @@ async function fadeOutAndPause(
     )
 
     videos.forEach((video) => video.pause())
-    console.log('[spandan] fadeOutAndPause complete')
   } finally {
     // Restore original volume so a manual resume isn't silent.
     videos.forEach((video) => {
@@ -190,7 +194,6 @@ async function fadeInAndPlay(
 ): Promise<void> {
   extensionFading = true
   extensionPlayed = true
-  console.log('[spandan] fadeInAndPlay start', videos.length, 'video(s)')
 
   try {
     videos.forEach((video) => {
@@ -207,7 +210,6 @@ async function fadeInAndPlay(
         return fadeVolume(video, 0, target, durationMs)
       }),
     )
-    console.log('[spandan] fadeInAndPlay complete')
   } finally {
     setTimeout(() => {
       extensionFading = false
@@ -220,27 +222,42 @@ async function fadeInAndPlay(
 // Message handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Report success only if the videos actually reached the requested state, so
+ * the background never records a play/pause that did not happen (e.g. play()
+ * rejected by autoplay policy).
+ */
+function respondWithOutcome(
+  sendResponse: (response: ExtensionResponse) => void,
+  videos: HTMLVideoElement[],
+  expectPlaying: boolean,
+): void {
+  const status = getVideoStatus(videos)
+  if (status.isPlaying === expectPlaying) {
+    sendResponse({ ok: true, payload: status })
+  } else {
+    sendResponse({
+      ok: false,
+      payload: expectPlaying ? 'playback did not start' : 'video still playing',
+    })
+  }
+}
+
 chrome.runtime.onMessage.addListener(
   (
     message: ExtensionMessage,
     _sender,
     sendResponse: (response: ExtensionResponse) => void,
   ) => {
-    console.log('[spandan] CONTENT MESSAGE RECEIVED', {
-      location: window.location.href,
-      message,
-    })
+
 
     if (!isYouTubePage()) {
-      console.log('[spandan] rejecting message: not a YouTube page', window.location.href)
       sendResponse({ ok: false, payload: 'not a YouTube page' })
       return true
     }
 
     const videos = getVideoElements()
     videos.forEach(attachMediaListeners)
-
-    console.log('[spandan] videos found', videos.length)
 
     if (videos.length === 0) {
       sendResponse({ ok: false, payload: 'video element not ready' })
@@ -249,14 +266,9 @@ chrome.runtime.onMessage.addListener(
 
     switch (message.type) {
       case 'PLAY': {
-        console.log('[spandan] PLAY requested for', videos.length, 'video(s)')
         extensionPlayed = true
         Promise.all(videos.map((video) => video.play().catch(() => {})))
-          .then(() => {
-            const status = getVideoStatus(videos)
-            console.log('[spandan] after PLAY, isPlaying =', status.isPlaying)
-            sendResponse({ ok: true, payload: status })
-          })
+          .then(() => respondWithOutcome(sendResponse, videos, true))
           .catch((error: unknown) =>
             sendResponse({ ok: false, payload: String(error) }),
           )
@@ -269,12 +281,9 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'PAUSE': {
-        console.log('[spandan] PAUSE requested for', videos.length, 'video(s)')
         extensionPaused = true
         videos.forEach((video) => video.pause())
-        const status = getVideoStatus(videos)
-        console.log('[spandan] after PAUSE, isPlaying =', status.isPlaying)
-        sendResponse({ ok: true, payload: status })
+        respondWithOutcome(sendResponse, videos, false)
         setTimeout(() => {
           extensionPaused = false
         }, 50)
@@ -284,16 +293,9 @@ chrome.runtime.onMessage.addListener(
       case 'FADE_OUT_PAUSE': {
         const fadeOutDuration =
           (message.payload as { durationMs: number }).durationMs ?? 500
-        console.log(
-          '[spandan] FADE_OUT_PAUSE requested, duration =',
-          fadeOutDuration,
-        )
+
         fadeOutAndPause(videos, fadeOutDuration)
-          .then(() => {
-            const status = getVideoStatus(videos)
-            console.log('[spandan] after FADE_OUT_PAUSE, isPlaying =', status.isPlaying)
-            sendResponse({ ok: true, payload: status })
-          })
+          .then(() => respondWithOutcome(sendResponse, videos, false))
           .catch((error: unknown) =>
             sendResponse({ ok: false, payload: String(error) }),
           )
@@ -303,16 +305,9 @@ chrome.runtime.onMessage.addListener(
       case 'FADE_IN_PLAY': {
         const fadeInDuration =
           (message.payload as { durationMs: number }).durationMs ?? 500
-        console.log(
-          '[spandan] FADE_IN_PLAY requested, duration =',
-          fadeInDuration,
-        )
+
         fadeInAndPlay(videos, fadeInDuration)
-          .then(() => {
-            const status = getVideoStatus(videos)
-            console.log('[spandan] after FADE_IN_PLAY, isPlaying =', status.isPlaying)
-            sendResponse({ ok: true, payload: status })
-          })
+          .then(() => respondWithOutcome(sendResponse, videos, true))
           .catch((error: unknown) =>
             sendResponse({ ok: false, payload: String(error) }),
           )
@@ -321,13 +316,11 @@ chrome.runtime.onMessage.addListener(
 
       case 'GET_VIDEO_STATUS': {
         const status = getVideoStatus(videos)
-        console.log('[spandan] GET_VIDEO_STATUS', status)
         sendResponse({ ok: true, payload: status })
         return true
       }
 
       default:
-        console.log('[spandan] unknown message type', message.type)
         sendResponse({ ok: false, payload: 'unknown message type' })
         return true
     }
