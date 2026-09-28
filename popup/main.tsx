@@ -7,12 +7,7 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <Suspense
       fallback={
-        <div className="w-80 bg-slate-950 p-4 text-sm text-white">
-          <p>Loading spandan...</p>
-          <p className="mt-1 text-xs text-slate-400">
-            This should only take a moment.
-          </p>
-        </div>
+        <div className="h-[360px] w-[356px] bg-[var(--spandan-bg)]" />
       }
     >
       <Popup />

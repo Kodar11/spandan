@@ -1,22 +1,30 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import type { LucideIcon } from 'lucide-react'
 import {
-  Headphones,
+  AlertTriangle,
+  ArrowRight,
+  AudioLines,
+  Hand,
+  Info,
   Music2,
+  Pause,
+  Power,
   Settings,
-  Volume2,
+  Timer,
 } from 'lucide-react'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { Logo } from '@/components/ui/Logo'
-import { StatusBadge } from '@/components/ui/StatusBadge'
 import { Toggle } from '@/components/ui/Toggle'
 import { getComputedStatus } from '@/lib/status'
 import {
   DEFAULT_SETTINGS,
+  DEFAULT_STATE,
   getSettings,
   getState,
   setSettings,
 } from '@/lib/storage'
+import { cleanTabTitle, getHostname, isYouTubeUrl } from '@/lib/tabs'
 import type {
   ExtensionResponse,
   ExtensionSettings,
@@ -31,10 +39,15 @@ interface UiState {
   reason: string
   musicTab: MusicTab | null
   waitingSeconds: number | null
+  /** A real failure (worker unreachable). Replaces the status card. */
   error: string | null
+  /** Guidance after an action the user can fix (e.g. not a YouTube tab). */
+  notice: string | null
 }
 
 const WORKER_TIMEOUT_MS = 2000
+const WORKER_ERROR = 'Reload the extension, then try again.'
+const NOT_YOUTUBE_NOTICE = 'Open a YouTube video in this tab, then try again.'
 
 function sendMessageWithTimeout<T>(
   message: unknown,
@@ -70,98 +83,91 @@ async function loadInitialStatus(): Promise<UiState> {
       musicTab: status.musicTab,
       waitingSeconds: status.waitingSeconds,
       error: null,
+      notice: null,
     }
   } catch (error) {
     console.error('[spandan] popup failed to load status', error)
 
-    const settings = await getSettings().catch(() => DEFAULT_SETTINGS)
+    const [settings, state] = await Promise.all([
+      getSettings().catch(() => DEFAULT_SETTINGS),
+      getState().catch(() => DEFAULT_STATE),
+    ])
 
     return {
       settings,
       status: 'no_music_tab',
-      reason: 'Extension worker is not responding',
-      musicTab: null,
+      reason: '',
+      musicTab: state.musicTab,
       waitingSeconds: null,
-      error:
-        'Extension worker is not responding. Try reloading the extension from brave://extensions.',
+      error: WORKER_ERROR,
+      notice: null,
     }
   }
 }
 
-function statusLabel(status: PlaybackStatus): string {
-  switch (status) {
-    case 'disabled':
-      return 'Extension disabled'
-    case 'no_music_tab':
-      return 'No music tab'
-    case 'playing':
-      return 'Music playing'
-    case 'paused':
-      return 'Music paused'
-    case 'waiting':
-      return 'Waiting to resume'
-    case 'manual_pause':
-      return 'Auto-pause off'
-    default:
-      return 'Unknown'
-  }
+// ---------------------------------------------------------------------------
+// Status presentation
+// ---------------------------------------------------------------------------
+
+interface StatusLook {
+  title: string
+  icon: LucideIcon
+  /** Icon tile colours. */
+  tile: string
 }
 
-function statusIcon(status: PlaybackStatus) {
-  switch (status) {
-    case 'playing':
-      return <Music2 size={18} className="text-emerald-300" />
-    case 'waiting':
-      return <Volume2 size={18} className="text-amber-300" />
-    case 'paused':
-    case 'manual_pause':
-      return <Headphones size={18} className="text-slate-400" />
-    default:
-      return <Logo size={18} />
-  }
+const STATUS_LOOK: Record<PlaybackStatus | 'error', StatusLook> = {
+  playing: {
+    title: 'Music playing',
+    icon: AudioLines,
+    tile: 'bg-emerald-400/10 text-emerald-300 ring-emerald-300/15',
+  },
+  paused: {
+    title: 'Music paused',
+    icon: Pause,
+    tile: 'bg-cyan-400/10 text-cyan-300 ring-cyan-300/15',
+  },
+  waiting: {
+    title: 'Waiting to resume',
+    icon: Timer,
+    tile: 'bg-amber-400/10 text-amber-300 ring-amber-300/15',
+  },
+  manual_pause: {
+    title: 'Paused by you',
+    icon: Hand,
+    tile: 'bg-white/[0.06] text-slate-200 ring-white/10',
+  },
+  disabled: {
+    title: 'Spandan is off',
+    icon: Power,
+    tile: 'bg-white/[0.04] text-slate-500 ring-white/[0.06]',
+  },
+  no_music_tab: {
+    title: 'No music tab selected',
+    icon: Music2,
+    tile: 'bg-white/[0.04] text-slate-400 ring-white/[0.06]',
+  },
+  error: {
+    title: 'Something went wrong',
+    icon: AlertTriangle,
+    tile: 'bg-rose-400/10 text-rose-300 ring-rose-300/15',
+  },
 }
+
+function waitingReason(seconds: number): string {
+  return `Resuming in ${seconds} ${seconds === 1 ? 'second' : 'seconds'}.`
+}
+
+// ---------------------------------------------------------------------------
+// Popup
+// ---------------------------------------------------------------------------
 
 export default function Popup() {
   const [uiState, setUiState] = useState<UiState | null>(null)
+  const [activeTabIsYouTube, setActiveTabIsYouTube] = useState(true)
+  const [settingTab, setSettingTab] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
-    loadInitialStatus().then((state) => {
-      if (!cancelled) setUiState(state)
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  useEffect(() => {
-    if (uiState?.status !== 'waiting' || uiState.waitingSeconds === null)
-      return
-
-    const interval = setInterval(() => {
-      setUiState((current) => {
-        if (
-          !current ||
-          current.waitingSeconds === null ||
-          current.waitingSeconds <= 1
-        ) {
-          clearInterval(interval)
-          refreshStatus()
-          return current
-        }
-        return {
-          ...current,
-          waitingSeconds: current.waitingSeconds - 1,
-        }
-      })
-    }, 1000)
-
-    return () => clearInterval(interval)
-  }, [uiState?.status, uiState?.waitingSeconds])
-
-  async function refreshStatus() {
-    setUiState((current) => (current ? { ...current, error: null } : current))
-
+  const refreshStatus = useCallback(async () => {
     try {
       const response = await sendMessageWithTimeout<ExtensionResponse>({
         type: 'GET_STATUS',
@@ -177,6 +183,7 @@ export default function Popup() {
                 reason: payload.reason,
                 musicTab: payload.musicTab,
                 waitingSeconds: payload.waitingSeconds,
+                settings: { ...current.settings, enabled: payload.enabled },
                 error: null,
               }
             : current,
@@ -185,16 +192,70 @@ export default function Popup() {
     } catch (err) {
       console.error('[spandan] popup refresh failed', err)
       setUiState((current) =>
-        current
-          ? {
-              ...current,
-              error:
-                'Extension worker is not responding. Try reloading the extension.',
-            }
-          : current,
+        current ? { ...current, error: WORKER_ERROR } : current,
       )
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    loadInitialStatus().then((state) => {
+      if (!cancelled) setUiState(state)
+    })
+    chrome.tabs
+      .query({ active: true, currentWindow: true })
+      .then(([tab]) => {
+        if (!cancelled) setActiveTabIsYouTube(isYouTubeUrl(tab?.url))
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Keep the status live while the popup is open: the worker persists every
+  // pause/resume/wait, so storage changes are the signal to refresh.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const onChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      area: string,
+    ) => {
+      if (area !== 'local' || (!changes.state && !changes.settings)) return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => void refreshStatus(), 120)
+    }
+    chrome.storage.onChanged.addListener(onChanged)
+    return () => {
+      if (timer) clearTimeout(timer)
+      chrome.storage.onChanged.removeListener(onChanged)
+    }
+  }, [refreshStatus])
+
+  useEffect(() => {
+    if (uiState?.status !== 'waiting' || uiState.waitingSeconds === null)
+      return
+
+    const interval = setInterval(() => {
+      setUiState((current) => {
+        if (
+          !current ||
+          current.waitingSeconds === null ||
+          current.waitingSeconds <= 1
+        ) {
+          clearInterval(interval)
+          void refreshStatus()
+          return current
+        }
+        return {
+          ...current,
+          waitingSeconds: current.waitingSeconds - 1,
+        }
+      })
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [uiState?.status, uiState?.waitingSeconds, refreshStatus])
 
   const handleToggle = async (next: boolean) => {
     setUiState((current) =>
@@ -211,18 +272,28 @@ export default function Popup() {
   }
 
   const handleSetMusicTab = async () => {
-    setUiState((current) => (current ? { ...current, error: null } : current))
+    setUiState((current) =>
+      current ? { ...current, error: null, notice: null } : current,
+    )
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
 
     if (!tab?.id || !tab.url) {
       setUiState((current) =>
         current
-          ? { ...current, error: 'Could not identify the current tab.' }
+          ? { ...current, notice: 'Couldn’t read the current tab. Try again.' }
           : current,
       )
       return
     }
 
+    if (!isYouTubeUrl(tab.url)) {
+      setUiState((current) =>
+        current ? { ...current, notice: NOT_YOUTUBE_NOTICE } : current,
+      )
+      return
+    }
+
+    setSettingTab(true)
     try {
       const response = await sendMessageWithTimeout<ExtensionResponse>({
         type: 'SET_MUSIC_TAB',
@@ -238,7 +309,7 @@ export default function Popup() {
           current
             ? {
                 ...current,
-                error: String(response.payload ?? 'Failed to set music tab.'),
+                notice: String(response.payload ?? 'Couldn’t set the music tab.'),
               }
             : current,
         )
@@ -248,114 +319,281 @@ export default function Popup() {
     } catch (err) {
       console.error('[spandan] set music tab failed', err)
       setUiState((current) =>
-        current
-          ? {
-              ...current,
-              error:
-                'Extension worker is not responding. Try reloading the extension.',
-            }
-          : current,
+        current ? { ...current, error: WORKER_ERROR } : current,
       )
+    } finally {
+      setSettingTab(false)
     }
   }
 
   if (!uiState) {
     return (
-      <div className="flex h-44 w-80 items-center justify-center bg-[var(--spandan-bg)] p-4 text-white">
-        <Logo size={28} className="animate-pulse-soft" />
+      <div className="flex h-[360px] w-[356px] items-center justify-center bg-[var(--spandan-bg)]">
+        <Logo size={36} tile className="animate-pulse-soft" />
       </div>
     )
   }
 
-  const label = statusLabel(uiState.status)
+  const isOnboarding = !uiState.musicTab
+
+  const primaryAction = (
+    <Button
+      className="w-full"
+      onClick={handleSetMusicTab}
+      disabled={settingTab}
+    >
+      <Music2 size={16} strokeWidth={2.25} aria-hidden="true" />
+      Set Current Tab as Music Tab
+    </Button>
+  )
 
   return (
-    <div className="w-80 animate-fade-in bg-[var(--spandan-bg)] p-4 text-white">
-      <header className="mb-4 flex items-center gap-3">
-        <Logo size={28} />
-        <div>
-          <h1 className="text-base font-bold leading-tight tracking-tight text-white">
+    <div className="flex w-[356px] flex-col gap-3 bg-[var(--spandan-bg)] p-4 text-slate-100">
+      <header className="flex items-center gap-3 pb-1">
+        <Logo size={32} tile />
+        <div className="min-w-0">
+          <h1 className="text-[15px] leading-tight font-semibold tracking-tight">
             Spandan
           </h1>
-          <p className="text-[11px] leading-tight text-slate-500">
+          <p className="text-[11.5px] leading-tight text-slate-500">
             Adaptive music for deep focus
           </p>
         </div>
       </header>
 
-      {uiState.error ? (
-        <Card className="mb-4 border-rose-500/20 bg-rose-500/10">
-          <p className="text-sm text-rose-300">{uiState.error}</p>
-        </Card>
+      {isOnboarding ? (
+        <Onboarding
+          error={uiState.error}
+          action={primaryAction}
+          notice={uiState.notice}
+          activeTabIsYouTube={activeTabIsYouTube}
+        />
       ) : (
-        <Card variant="glass" className="mb-4">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-2">
-              {statusIcon(uiState.status)}
-              <StatusBadge status={uiState.status} label={label} />
-            </div>
+        <>
+          <StatusCard uiState={uiState} />
+
+          <Card
+            className={`px-4 py-3 ${
+              uiState.settings.enabled ? '' : 'bg-transparent'
+            }`}
+          >
+            <Toggle
+              label="Enable Spandan"
+              description="Automatically manage background music."
+              checked={uiState.settings.enabled}
+              onChange={handleToggle}
+            />
+          </Card>
+
+          <div className="space-y-2">
+            {primaryAction}
+            {uiState.notice && <Notice text={uiState.notice} />}
           </div>
-
-          <p className="mt-2 text-sm text-slate-300">{uiState.reason}</p>
-
-          {uiState.status === 'waiting' && uiState.waitingSeconds !== null && (
-            <div className="mt-3">
-              <div className="mb-1.5 flex items-center justify-between text-xs text-slate-400">
-                <span>Resuming</span>
-                <span className="font-medium text-amber-300">
-                  {uiState.waitingSeconds}s
-                </span>
-              </div>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700/60">
-                <div
-                  className="h-full rounded-full bg-amber-400 transition-all duration-1000 ease-linear"
-                  style={{
-                    width: `${Math.max(
-                      5,
-                      (uiState.waitingSeconds / (uiState.settings.resumeDelayMs / 1000)) * 100,
-                    )}%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {uiState.musicTab && (
-            <div className="mt-3 flex items-center gap-2 rounded-[var(--spandan-radius-sm)] bg-white/[0.03] px-2.5 py-2">
-              <Music2 size={14} className="shrink-0 text-slate-500" />
-              <p
-                className="truncate text-xs text-slate-400"
-                title={uiState.musicTab.url}
-              >
-                {uiState.musicTab.title}
-              </p>
-            </div>
-          )}
-        </Card>
+        </>
       )}
 
-      <Card className="mb-3">
-        <Toggle
-          label="Enable Spandan"
-          description="Automatically manage background music"
-          checked={uiState.settings.enabled}
-          onChange={handleToggle}
-        />
-      </Card>
-
-      <Button className="w-full" onClick={handleSetMusicTab}>
-        <Music2 size={16} />
-        Set Current Tab as Music Tab
-      </Button>
+      {isOnboarding && !uiState.settings.enabled && (
+        <Card className="bg-transparent px-4 py-3">
+          <Toggle
+            label="Enable Spandan"
+            description="Automatic music control is off."
+            checked={false}
+            onChange={handleToggle}
+          />
+        </Card>
+      )}
 
       <button
         type="button"
         onClick={() => chrome.runtime.openOptionsPage()}
-        className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-[var(--spandan-radius-sm)] py-2 text-xs font-medium text-slate-500 transition-colors hover:text-cyan-300"
+        className="spandan-focus mx-auto flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-slate-500 transition-colors duration-150 hover:text-slate-200"
       >
-        <Settings size={13} />
+        <Settings size={13} aria-hidden="true" />
         Open Settings
       </button>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Pieces
+// ---------------------------------------------------------------------------
+
+function StatusCard({ uiState }: { uiState: UiState }) {
+  const key = uiState.error ? 'error' : uiState.status
+  const look = STATUS_LOOK[key]
+  const Icon = look.icon
+  const reason = uiState.error
+    ? uiState.error
+    : uiState.status === 'waiting' && uiState.waitingSeconds !== null
+      ? waitingReason(uiState.waitingSeconds)
+      : uiState.reason
+
+  const isWaiting = !uiState.error && uiState.status === 'waiting'
+  const totalSeconds = Math.max(1, uiState.settings.resumeDelayMs / 1000)
+  const progress = isWaiting
+    ? Math.min(1, (uiState.waitingSeconds ?? 0) / totalSeconds)
+    : 0
+
+  return (
+    <Card className="overflow-hidden">
+      <div
+        key={key}
+        role="status"
+        aria-live="polite"
+        className="flex animate-fade-in items-center gap-3 px-4 pt-4 pb-3.5"
+      >
+        <span
+          className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] ring-1 ring-inset transition-colors duration-200 ${look.tile}`}
+        >
+          <Icon size={18} strokeWidth={2} aria-hidden="true" />
+        </span>
+        <div className="min-w-0">
+          <p className="text-[15px] leading-snug font-semibold text-slate-50">
+            {look.title}
+          </p>
+          <p
+            className={`truncate text-xs leading-snug ${
+              uiState.error ? 'text-rose-200/80' : 'text-slate-400'
+            }`}
+            title={reason}
+          >
+            {reason}
+          </p>
+        </div>
+      </div>
+
+      {/* Divider doubles as the resume countdown. */}
+      <div className="relative h-px bg-[var(--spandan-border)]">
+        <div
+          className="absolute inset-y-0 left-0 bg-amber-400/80 transition-[width,opacity] duration-1000 ease-linear"
+          style={{ width: `${progress * 100}%`, opacity: isWaiting ? 1 : 0 }}
+        />
+      </div>
+
+      {uiState.musicTab && (
+        <MusicTabRow
+          musicTab={uiState.musicTab}
+          dimmed={!uiState.settings.enabled}
+        />
+      )}
+    </Card>
+  )
+}
+
+function MusicTabRow({
+  musicTab,
+  dimmed,
+}: {
+  musicTab: MusicTab
+  dimmed: boolean
+}) {
+  const title = cleanTabTitle(musicTab.title)
+  const host = getHostname(musicTab.url)?.replace(/^www\./, '') ?? 'youtube.com'
+
+  return (
+    <div
+      className={`flex items-center gap-3 px-4 py-3 transition-opacity duration-200 ${
+        dimmed ? 'opacity-55' : ''
+      }`}
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] bg-white/[0.04] text-slate-400">
+        <Music2 size={15} aria-hidden="true" />
+      </span>
+      <div className="min-w-0">
+        <p className="text-[10.5px] leading-tight font-medium tracking-wide text-slate-500 uppercase">
+          Music tab
+        </p>
+        <p
+          className="truncate text-[13px] leading-snug font-medium text-slate-200"
+          title={title}
+        >
+          {title}
+        </p>
+        <p className="truncate text-[11px] leading-tight text-slate-500">{host}</p>
+      </div>
+    </div>
+  )
+}
+
+function Onboarding({
+  action,
+  error,
+  notice,
+  activeTabIsYouTube,
+}: {
+  action: React.ReactNode
+  error: string | null
+  notice: string | null
+  activeTabIsYouTube: boolean
+}) {
+  return (
+    <>
+      <Card className="flex animate-fade-in flex-col items-center px-5 pt-6 pb-5 text-center">
+        <Logo size={44} tile />
+        <h2 className="mt-4 text-[15px] font-semibold text-slate-50">
+          Choose your music tab
+        </h2>
+        <p className="mt-1 max-w-[240px] text-xs leading-relaxed text-slate-400">
+          Pick a YouTube tab for Spandan to manage in the background.
+        </p>
+
+        <div
+          aria-label="How Spandan works: choose music, browse, music resumes automatically"
+          role="img"
+          className="mt-4 flex items-center gap-1.5 text-[11px] font-medium text-slate-400"
+        >
+          <Step>Choose music</Step>
+          <ArrowRight size={11} className="text-slate-600" aria-hidden="true" />
+          <Step>Browse</Step>
+          <ArrowRight size={11} className="text-slate-600" aria-hidden="true" />
+          <Step>Auto-resume</Step>
+        </div>
+      </Card>
+
+      <div className="space-y-2">
+        {action}
+        {error ? (
+          <Notice text={error} tone="error" />
+        ) : notice ? (
+          <Notice text={notice} />
+        ) : (
+          <p className="px-2 text-center text-[11.5px] leading-snug text-slate-500">
+            {activeTabIsYouTube
+              ? 'Spandan pauses it when another tab plays audio.'
+              : 'Open a YouTube video in this tab to get started.'}
+          </p>
+        )}
+      </div>
+    </>
+  )
+}
+
+function Step({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="rounded-full bg-white/[0.04] px-2 py-0.5 ring-1 ring-inset ring-white/[0.06]">
+      {children}
+    </span>
+  )
+}
+
+function Notice({
+  text,
+  tone = 'info',
+}: {
+  text: string
+  tone?: 'info' | 'error'
+}) {
+  const Icon = tone === 'error' ? AlertTriangle : Info
+  return (
+    <p
+      role={tone === 'error' ? 'alert' : 'status'}
+      className={`flex animate-fade-in items-start justify-center gap-1.5 px-2 text-center text-[11.5px] leading-snug ${
+        tone === 'error' ? 'text-rose-300' : 'text-amber-200/90'
+      }`}
+    >
+      <Icon size={13} className="mt-px shrink-0" aria-hidden="true" />
+      {text}
+    </p>
   )
 }

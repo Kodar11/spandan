@@ -63,7 +63,7 @@ export function getHostname(url: string | undefined): string | undefined {
  * Users may enter "youtube.com", "https://www.youtube.com/", or
  * "www.youtube.com". This strips protocols and paths.
  */
-function normalizeWhitelistEntry(entry: string): string {
+export function normalizeWhitelistEntry(entry: string): string {
   const trimmed = entry.trim().toLowerCase()
   if (!trimmed) return ''
 
@@ -108,26 +108,44 @@ export function matchesWhitelist(
   })
 }
 
+// Proper names for common audio sources; anything else shows its hostname.
+const SITE_LABELS: Record<string, string> = {
+  'youtube.com': 'YouTube',
+  'music.youtube.com': 'YouTube Music',
+  'youtube-nocookie.com': 'YouTube',
+  'spotify.com': 'Spotify',
+  'open.spotify.com': 'Spotify',
+  'netflix.com': 'Netflix',
+  'primevideo.com': 'Prime Video',
+  'udemy.com': 'Udemy',
+  'coursera.org': 'Coursera',
+  'twitch.tv': 'Twitch',
+  'vimeo.com': 'Vimeo',
+  'soundcloud.com': 'SoundCloud',
+  'meet.google.com': 'Google Meet',
+  'app.zoom.us': 'Zoom',
+}
+
 /**
- * Returns a user-facing site name for a URL.
- *
- * Prefers the tab title when available, otherwise derives a readable name from
- * the hostname.
+ * Short, readable name for the site a URL belongs to ("YouTube", "udemy.com").
  */
-export function getSiteName(
-  url: string | undefined,
-  title?: string,
-): string {
-  if (title) {
-    // YouTube titles end with " - YouTube"; strip that for a cleaner label.
-    const cleaned = title.replace(/\s*[-|]\s*YouTube\s*$/i, '').trim()
-    if (cleaned) return cleaned
-  }
+export function getSiteLabel(url: string | undefined): string {
+  const hostname = getHostname(url)?.toLowerCase().replace(/^www\./, '')
+  if (!hostname) return 'Another tab'
+  return SITE_LABELS[hostname] ?? hostname
+}
 
-  const hostname = getHostname(url)
-  if (!hostname) return 'Unknown site'
-
-  return hostname.replace(/^www\./, '')
+/**
+ * Clean a YouTube tab title for display: drops the unread-count prefix
+ * ("(3) ") and the " - YouTube" suffix.
+ */
+export function cleanTabTitle(title: string): string {
+  return (
+    title
+      .replace(/^\(\d+\)\s*/, '')
+      .replace(/\s*[-|]\s*YouTube( Music)?\s*$/i, '')
+      .trim() || title
+  )
 }
 
 /**

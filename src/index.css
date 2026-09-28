@@ -2,16 +2,18 @@
 
 @layer base {
   :root {
-    /* Spandan calm dark palette */
-    --spandan-bg: #0b0f14;
-    --spandan-surface: #111821;
-    --spandan-elevated: #18202b;
-    --spandan-border: rgba(148, 163, 184, 0.12);
-    --spandan-text-primary: #f8fafc;
+    /* Palette derived from the Spandan icon (#23d2ee). */
+    --spandan-bg: #0a0d12;
+    --spandan-surface: #11161d;
+    --spandan-surface-hover: #151b23;
+    --spandan-elevated: #161c25;
+    --spandan-border: rgba(148, 163, 184, 0.1);
+    --spandan-border-strong: rgba(148, 163, 184, 0.18);
+    --spandan-text-primary: #f1f5f9;
     --spandan-text-secondary: #94a3b8;
     --spandan-text-muted: #64748b;
-    --spandan-cyan: #22d3ee;
-    --spandan-cyan-soft: rgba(34, 211, 238, 0.12);
+    --spandan-cyan: #23d2ee;
+    --spandan-cyan-soft: rgba(35, 210, 238, 0.1);
     --spandan-indigo: #818cf8;
     --spandan-indigo-soft: rgba(129, 140, 248, 0.12);
     --spandan-emerald: #34d399;
@@ -22,9 +24,11 @@
     --spandan-rose-soft: rgba(251, 113, 133, 0.12);
     --spandan-radius-sm: 10px;
     --spandan-radius-md: 14px;
-    --spandan-radius-lg: 18px;
+    --spandan-radius-lg: 16px;
     --spandan-transition-fast: 150ms ease;
     --spandan-transition-base: 200ms ease;
+
+    color-scheme: dark;
   }
 
   html {
@@ -45,8 +49,18 @@
   }
 
   ::selection {
-    background-color: var(--spandan-cyan-soft);
-    color: var(--spandan-cyan);
+    background-color: rgba(35, 210, 238, 0.25);
+    color: var(--spandan-text-primary);
+  }
+
+  /* Hide number-input spinners; values are typed. */
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] {
+    -moz-appearance: textfield;
   }
 }
 
@@ -56,43 +70,16 @@
     border: 1px solid var(--spandan-border);
   }
 
-  .spandan-elevated {
-    background-color: var(--spandan-elevated);
-    border: 1px solid var(--spandan-border);
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.24);
-  }
-
-  .spandan-glass {
-    background: linear-gradient(
-      145deg,
-      rgba(255, 255, 255, 0.06),
-      rgba(255, 255, 255, 0.02)
-    );
-    border: 1px solid var(--spandan-border);
-    backdrop-filter: blur(12px);
-  }
-
   .spandan-focus {
     @apply outline-none;
   }
 
   .spandan-focus:focus-visible {
-    box-shadow: 0 0 0 2px var(--spandan-bg), 0 0 0 4px var(--spandan-cyan);
-  }
-
-  .spandan-text-gradient {
-    background: linear-gradient(135deg, var(--spandan-cyan), var(--spandan-indigo));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    box-shadow: 0 0 0 2px var(--spandan-bg), 0 0 0 4px rgba(35, 210, 238, 0.7);
   }
 
   .animate-fade-in {
-    animation: fadeIn 250ms ease-out both;
-  }
-
-  .animate-scale-in {
-    animation: scaleIn 200ms ease-out both;
+    animation: fadeIn 220ms ease-out both;
   }
 
   .animate-pulse-soft {
@@ -103,22 +90,11 @@
 @keyframes fadeIn {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(4px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
-  }
-}
-
-@keyframes scaleIn {
-  from {
-    opacity: 0;
-    transform: scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
   }
 }
 
@@ -128,6 +104,16 @@
     opacity: 1;
   }
   50% {
-    opacity: 0.65;
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
   }
 }

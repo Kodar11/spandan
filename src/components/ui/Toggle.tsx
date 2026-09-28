@@ -1,36 +1,62 @@
+import { useId } from 'react'
+
 interface ToggleProps {
   checked: boolean
   onChange: (checked: boolean) => void
   label: string
   description?: string
+  className?: string
 }
 
-export function Toggle({ checked, onChange, label, description }: ToggleProps) {
+/** Switch with its label; the whole row is clickable. */
+export function Toggle({
+  checked,
+  onChange,
+  label,
+  description,
+  className = '',
+}: ToggleProps) {
+  const labelId = useId()
+  const descriptionId = useId()
+
   return (
-    <label className="group flex cursor-pointer items-center justify-between gap-4">
-      <div className="flex flex-col">
-        <span className="text-sm font-medium text-slate-100">{label}</span>
+    <div
+      className={`group flex cursor-pointer items-center justify-between gap-4 ${className}`}
+      onClick={() => onChange(!checked)}
+    >
+      <div className="min-w-0">
+        <p id={labelId} className="text-sm font-medium text-slate-100">
+          {label}
+        </p>
         {description && (
-          <span className="text-xs text-slate-500">{description}</span>
+          <p id={descriptionId} className="text-xs leading-snug text-slate-500">
+            {description}
+          </p>
         )}
       </div>
       <button
         type="button"
         role="switch"
         aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors duration-200 spandan-focus ${
+        aria-labelledby={labelId}
+        aria-describedby={description ? descriptionId : undefined}
+        onClick={(event) => {
+          // The row handles the click; don't toggle twice.
+          event.stopPropagation()
+          onChange(!checked)
+        }}
+        className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition-colors duration-200 spandan-focus ${
           checked
-            ? 'bg-gradient-to-r from-cyan-500 to-indigo-500'
-            : 'bg-slate-700'
+            ? 'bg-cyan-500'
+            : 'bg-slate-700 group-hover:bg-slate-600'
         }`}
       >
         <span
-          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform duration-200 ${
-            checked ? 'translate-x-6' : 'translate-x-1'
+          className={`inline-block h-[18px] w-[18px] rounded-full bg-white shadow-sm transition-transform duration-200 ${
+            checked ? 'translate-x-[19px]' : 'translate-x-[3px]'
           }`}
         />
       </button>
-    </label>
+    </div>
   )
 }

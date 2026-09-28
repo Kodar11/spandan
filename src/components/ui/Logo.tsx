@@ -1,50 +1,36 @@
 interface LogoProps {
+  /** Size of the square tile in px. */
   size?: number
+  /** Render the icon on a subtle tile so it sits naturally on dark surfaces. */
+  tile?: boolean
   className?: string
 }
 
-export function Logo({ size = 32, className = '' }: LogoProps) {
-  return (
-    <svg
+// The same artwork as the toolbar icon. Root-relative so it resolves from any
+// extension page (chrome-extension://<id>/icon_128.png).
+const ICON_SRC = '/icon_128.png'
+
+export function Logo({ size = 32, tile = false, className = '' }: LogoProps) {
+  const image = (
+    <img
+      src={ICON_SRC}
       width={size}
       height={size}
-      viewBox="0 0 48 48"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      className={className}
+      alt=""
       aria-hidden="true"
+      draggable={false}
+      className={tile ? undefined : className}
+    />
+  )
+
+  if (!tile) return image
+
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center justify-center overflow-hidden rounded-[28%] bg-cyan-400/[0.08] ring-1 ring-inset ring-cyan-300/15 ${className}`}
+      style={{ width: size, height: size }}
     >
-      <defs>
-        <linearGradient id="spandan-logo-gradient" x1="0" y1="0" x2="48" y2="48">
-          <stop stopColor="#22d3ee" />
-          <stop offset="1" stopColor="#818cf8" />
-        </linearGradient>
-      </defs>
-      {/* Central S-shaped wave */}
-      <path
-        d="M16 18c0-4.4 3.6-8 8-8h8c4.4 0 8 3.6 8 8s-3.6 8-8 8h-8c-4.4 0-8 3.6-8 8s3.6 8 8 8h8c4.4 0 8-3.6 8-8"
-        stroke="url(#spandan-logo-gradient)"
-        strokeWidth="5"
-        strokeLinecap="round"
-        fill="none"
-      />
-      {/* Subtle ripple arcs */}
-      <path
-        d="M10 24c0-8 6-14 14-14"
-        stroke="url(#spandan-logo-gradient)"
-        strokeWidth="2"
-        strokeLinecap="round"
-        opacity="0.35"
-        fill="none"
-      />
-      <path
-        d="M38 24c0 8-6 14-14 14"
-        stroke="url(#spandan-logo-gradient)"
-        strokeWidth="2"
-        strokeLinecap="round"
-        opacity="0.35"
-        fill="none"
-      />
-    </svg>
+      {image}
+    </span>
   )
 }

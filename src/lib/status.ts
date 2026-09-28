@@ -1,6 +1,6 @@
 import { queryVideoStatus } from '@/lib/video'
 import {
-  getSiteName,
+  getSiteLabel,
   isMusicTab,
   matchesWhitelist,
   queryAudibleTabs,
@@ -30,7 +30,7 @@ export function computeStatus(
       enabled: false,
       musicTab: state.musicTab,
       status: 'disabled',
-      reason: 'Extension disabled',
+      reason: 'Automatic music control is disabled.',
       waitingSeconds: null,
     }
   }
@@ -40,7 +40,7 @@ export function computeStatus(
       enabled: true,
       musicTab: null,
       status: 'no_music_tab',
-      reason: 'No music tab selected',
+      reason: 'Choose a YouTube tab to start.',
       waitingSeconds: null,
     }
   }
@@ -50,8 +50,7 @@ export function computeStatus(
       enabled: true,
       musicTab: state.musicTab,
       status: 'manual_pause',
-      reason:
-        'You paused/muted the music tab. Play or unmute to resume auto-management.',
+      reason: 'Play or unmute to resume auto-control.',
       waitingSeconds: null,
     }
   }
@@ -63,15 +62,12 @@ export function computeStatus(
   )
 
   if (nonMusicAudibleTabs.length > 0) {
-    const site = getSiteName(
-      nonMusicAudibleTabs[0].url,
-      nonMusicAudibleTabs[0].title,
-    )
+    const site = getSiteLabel(nonMusicAudibleTabs[0].url)
     return {
       enabled: true,
       musicTab: state.musicTab,
       status: 'paused',
-      reason: `${site} is playing`,
+      reason: `${site} is playing.`,
       waitingSeconds: null,
     }
   }
@@ -83,7 +79,7 @@ export function computeStatus(
       enabled: true,
       musicTab: state.musicTab,
       status: 'waiting',
-      reason: `Waiting ${remainingSeconds} seconds before resuming`,
+      reason: `Resuming in ${remainingSeconds} ${remainingSeconds === 1 ? 'second' : 'seconds'}.`,
       waitingSeconds: remainingSeconds,
     }
   }
@@ -97,7 +93,7 @@ export function computeStatus(
       enabled: true,
       musicTab: state.musicTab,
       status: 'playing',
-      reason: 'Music playing',
+      reason: 'Playing normally.',
       waitingSeconds: null,
     }
   }
@@ -106,7 +102,7 @@ export function computeStatus(
     enabled: true,
     musicTab: state.musicTab,
     status: 'paused',
-    reason: 'Music paused',
+    reason: 'Resumes when the music tab is ready.',
     waitingSeconds: null,
   }
 }
